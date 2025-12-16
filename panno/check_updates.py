@@ -72,53 +72,67 @@ def actualizar_clinaan():
         print(f"An error occurred while downloading PharmGKB guidelines: {e}")
 
 def actualizar_guidelines():
-    try:
-        response = requests.get(f"{url_api}/data/guideline")
-        response.raise_for_status()  # Raise an error for bad status codes
-
-        guidelines = response.json().get('data', [])
-    except Exception as e:
-        print(f"Error API: {e}")
-        return
-
+    # Definimos explícitamente qué fuentes queremos buscar para cumplir con "Missing criteria"
+    target_sources = ['CPIC', 'DPWG', 'RNPGx']
     merge_rows = []
-    
+
+    print(f"Iniciando búsqueda de guías para: {', '.join(target_sources)}...")
+
     with requests.Session() as session:
         session.headers.update(HEADERS)
-        
-        for g in guidelines:
-            if g.get('source') not in ['CPIC', 'DPWG', 'RNPGx']: continue
-            
-            try:
-                r_det = session.get(f"{url_api}/data/guideline/{g['id']}")
-                if r_det.status_code != 200: continue
-                
-                data = r_det.json().get('data', {})
-                
-                genes_list = data.get('relatedGenes', [])
-                gene = genes_list[0].get('symbol', 'Unknown') if genes_list else 'Unknown'
-                
-                chems_list = data.get('relatedChemicals', [])
-                drug = chems_list[0].get('name', 'Unknown') if chems_list else 'Unknown'
 
-                for rec in data.get('recommendation', []):
-                    merge_rows.append({
-                        'ID': g['id'],
-                        'Source': g.get('source'),
-                        'Gene': gene,
-                        'Drug': drug,
-                        'Phenotype': rec.get('phenotype', ''),
-                        'Recommendation': rec.get('textualRecommendation', ''),
-                        'Summary': rec.get('implication', ''),
-                        'Avoid': 0, 'Alternate': 0, 'Dosing': 0
-                    })
-            except Exception as inner_e:
-                print(f"Error procesando guía {g.get('id')}: {inner_e}")
+        for source in target_sources:
+            try:
+                print(f"📡 Solicitando guías de {source}...")
+                # AQUÍ ESTÁ EL ARREGLO: Enviamos 'source' como parámetro
+                response = session.get(f"{url_api}/data/guideline", params={'source': source}, timeout=30)
+                
+                if response.status_code != 200:
+                    print(f"⚠️ {source} devolvió estado {response.status_code}. Saltando...")
+                    continue
+                
+                # Obtenemos la lista de guías de esa fuente específica
+                guidelines_list = response.json().get('data', [])
+                print(f"   -> Encontradas {len(guidelines_list)} guías para {source}. Descargando detalles...")
+
+                # Ahora iteramos sobre cada guía encontrada para sacar los detalles
+                for g in guidelines_list:
+                    try:
+                        # Petición de detalle (esta URL sigue igual)
+                        r_det = session.get(f"{url_api}/data/guideline/{g['id']}")
+                        if r_det.status_code != 200: continue
+                        
+                        data = r_det.json().get('data', {})
+                        
+                        # Extracción segura de datos
+                        genes_list = data.get('relatedGenes', [])
+                        gene = genes_list[0].get('symbol', 'Unknown') if genes_list else 'Unknown'
+                        
+                        chems_list = data.get('relatedChemicals', [])
+                        drug = chems_list[0].get('name', 'Unknown') if chems_list else 'Unknown'
+
+                        for rec in data.get('recommendation', []):
+                            merge_rows.append({
+                                'ID': g['id'],
+                                'Source': source, # Usamos la variable del loop
+                                'Gene': gene,
+                                'Drug': drug,
+                                'Phenotype': rec.get('phenotype', ''),
+                                'Recommendation': rec.get('textualRecommendation', ''),
+                                'Summary': rec.get('implication', ''),
+                                'Avoid': 0, 'Alternate': 0, 'Dosing': 0
+                            })
+                    except Exception as inner_e:
+                        # Error en una guía individual no detiene el proceso
+                        continue
+
+            except Exception as e:
+                print(f"❌ Error procesando fuente {source}: {e}")
                 continue
 
+    # Retorno seguro
     if merge_rows:
-        df_guidelines = pd.DataFrame(merge_rows)
-        return df_guidelines
+        return pd.DataFrame(merge_rows)
     else:
         return pd.DataFrame()
 
