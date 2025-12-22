@@ -3,6 +3,8 @@ import os
 import zipfile
 import pandas as pd
 import io
+import json
+import sqlite3
 
 url = "https://api.pharmgkb.org/v1/download/file/data/clinicalAnnotations.zip"
 url_api = "https://api.pharmgkb.org/v1"
@@ -20,28 +22,35 @@ HEADERS = {
 #Generar ClinAnn
 def actualizar_clinaan():
     try:
+        print(f"⬇️ Iniciando descarga de ClinAnn desde: {url}...")
         response = requests.get(url, headers=HEADERS, timeout=60)
         response.raise_for_status()  # Raise an error for bad status codes
+        print("✅ Descarga completada.")
 
+        print("📦 Descomprimiendo archivos...")
         with zipfile.ZipFile(io.BytesIO(response.content)) as z:
             z.extract("clinical_annotations.tsv", temp_dir)
             z.extract("clinical_ann_alleles.tsv", temp_dir)
             #z.extract("clinical_ann_evidence.tsv", temp_dir)
         
+        print("📊 Leyendo archivos CSV...")
         df_meta = pd.read_csv(f"{temp_dir}clinical_annotations.tsv", sep="\t")
         df_alleles = pd.read_csv(f"{temp_dir}clinical_ann_alleles.tsv", sep="\t")
         #df_evidence = pd.read_csv(f"{temp_dir}clinical_ann_evidence.tsv", sep="\t")
 
+        print("🔄 Procesando y uniendo datos (esto puede tardar un poco)...")
         merged = pd.merge(df_alleles, df_meta, on="Clinical Annotation ID", how="inner")
 
         def split_alleles(g):
             if pd.isna(g) or len(g) != 2: return g, None # Fallback simple
             return g[0], g[1]
 
+        print("🧬 Dividiendo alelos...")
         merged[['Allele1', 'Allele2']] = merged['Genotype/Allele'].apply(
             lambda x: pd.Series(split_alleles(x))
         )
 
+        print("📝 Construyendo DataFrame final...")
         df_final = pd.DataFrame()
         df_final['CAID'] = merged['Clinical Annotation ID']
         df_final['Gene'] = merged['Gene']
@@ -61,6 +70,7 @@ def actualizar_clinaan():
         df_final['LevelOverride'] = merged['Level Override']
         df_final['LevelModifier'] = merged["Level Modifiers"]
         df_final['Score'] = merged['Score']
+        df_final['PMIDCount'] = merged["PMID Count"]
         df_final['EvidenceCount'] = merged["Evidence Count"]
         df_final['Specialty'] = merged["Specialty Population"]
         df_final['PhenotypeCategory'] = merged['Phenotype Category']
@@ -72,68 +82,172 @@ def actualizar_clinaan():
         print(f"An error occurred while downloading PharmGKB guidelines: {e}")
 
 def actualizar_guidelines():
-    # Definimos explícitamente qué fuentes queremos buscar para cumplir con "Missing criteria"
-    target_sources = ['CPIC', 'DPWG', 'RNPGx']
-    merge_rows = []
+    # URL para descargar annotations en formato JSON (el ZIP contiene muchos JSONs)
+    # Nota: La API devuelve 303 Redirect a S3, requests lo maneja automticamente.
+    url_guidelines_zip = "https://api.pharmgkb.org/v1/download/file/data/guidelineAnnotations.json.zip"
+    
+    try:
+        print(f"⬇️ Descargando archivo masivo de Guidelines (JSON) desde: {url_guidelines_zip}...")
+        response = requests.get(url_guidelines_zip, headers=HEADERS, timeout=60)
+        response.raise_for_status()
 
-    print(f"Iniciando búsqueda de guías para: {', '.join(target_sources)}...")
+        print("📦 Descomprimiendo archivos JSON...")
+        # Limpiamos temp_dir de JSONs previos para evitar mezclas
+        for f in os.listdir(temp_dir):
+            if f.endswith(".json"):
+                os.remove(os.path.join(temp_dir, f))
 
-    with requests.Session() as session:
-        session.headers.update(HEADERS)
-
-        for source in target_sources:
+        with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+            z.extractall(temp_dir)
+        
+        print("📊 Procesando archivos JSON de Guidelines...")
+        
+        data_rows = []
+        # Iteramos sobre todos los archivos JSON extraídos
+        json_files = [f for f in os.listdir(temp_dir) if f.endswith(".json")]
+        
+        target_sources = ['CPIC', 'DPWG', 'RNPGx']
+        
+        for json_file in json_files:
             try:
-                print(f"📡 Solicitando guías de {source}...")
-                # AQUÍ ESTÁ EL ARREGLO: Enviamos 'source' como parámetro
-                response = session.get(f"{url_api}/data/guideline", params={'source': source}, timeout=30)
-                
-                if response.status_code != 200:
-                    print(f"⚠️ {source} devolvió estado {response.status_code}. Saltando...")
-                    continue
-                
-                # Obtenemos la lista de guías de esa fuente específica
-                guidelines_list = response.json().get('data', [])
-                print(f"   -> Encontradas {len(guidelines_list)} guías para {source}. Descargando detalles...")
-
-                # Ahora iteramos sobre cada guía encontrada para sacar los detalles
-                for g in guidelines_list:
-                    try:
-                        # Petición de detalle (esta URL sigue igual)
-                        r_det = session.get(f"{url_api}/data/guideline/{g['id']}")
-                        if r_det.status_code != 200: continue
-                        
-                        data = r_det.json().get('data', {})
-                        
-                        # Extracción segura de datos
-                        genes_list = data.get('relatedGenes', [])
-                        gene = genes_list[0].get('symbol', 'Unknown') if genes_list else 'Unknown'
-                        
-                        chems_list = data.get('relatedChemicals', [])
-                        drug = chems_list[0].get('name', 'Unknown') if chems_list else 'Unknown'
-
-                        for rec in data.get('recommendation', []):
-                            merge_rows.append({
-                                'ID': g['id'],
-                                'Source': source, # Usamos la variable del loop
-                                'Gene': gene,
-                                'Drug': drug,
-                                'Phenotype': rec.get('phenotype', ''),
-                                'Recommendation': rec.get('textualRecommendation', ''),
-                                'Summary': rec.get('implication', ''),
-                                'Avoid': 0, 'Alternate': 0, 'Dosing': 0
-                            })
-                    except Exception as inner_e:
-                        # Error en una guía individual no detiene el proceso
+                with open(os.path.join(temp_dir, json_file), 'r', encoding='utf-8') as f:
+                    d = json.load(f)
+                    
+                    # Estructura típica: d['guideline'] contiene la info
+                    g = d.get('guideline', {})
+                    source = g.get('source', '')
+                    
+                    if source not in target_sources:
                         continue
+                        
+                    # Extraer campos clave
+                    guideline_id = g.get('id', '')
+                    
+                    # Summary y Recommendation vienen a veces en summaryMarkdown (objeto o string)
+                    summary_obj = g.get('summaryMarkdown', {})
+                    summary_text = ""
+                    if isinstance(summary_obj, dict):
+                        summary_text = summary_obj.get('html', '')
+                    else:
+                        summary_text = str(summary_obj)
+                    
+                    summary_text = summary_text.replace('\n', ' ').strip()
+                    
+                    # Genes (puede haber varios, tomamos los símbolos unidos)
+                    genes = [x.get('symbol', '') for x in g.get('relatedGenes', [])]
+                    gene_str = "; ".join(filter(None, genes))
+                    
+                    # Drugs
+                    drugs = [x.get('name', '') for x in g.get('relatedChemicals', [])]
+                    drug_str = "; ".join(filter(None, drugs))
 
+                    # Mapeo a columnas de GuidelineMerge (Schema Match)
+                    row = {
+                        # 'ID': ser asignado después numéricamente
+                        'Source': source,
+                        'PAID': guideline_id, # ID original de PharmGKB va aquí
+                        'Summary': g.get('name', ''), # Título como summary
+                        'Phenotype': "", 
+                        'Genotype': "", # Schema expects this
+                        'Recommendation': summary_text, 
+                        'Avoid': 0, # Default
+                        'Alternate': 1 if g.get('alternateDrugAvailable') else 0,
+                        'Dosing': 1 if g.get('dosingInformation') else 0,
+                        'Gene': gene_str,
+                        'Drug': drug_str,
+                        'GeneID': 0, # Filler
+                        'DrugID': 0  # Filler
+                    }
+                    data_rows.append(row)
+                    
             except Exception as e:
-                print(f"❌ Error procesando fuente {source}: {e}")
+                print(f"⚠️ Error leyendo {json_file}: {e}")
                 continue
 
-    # Retorno seguro
-    if merge_rows:
-        return pd.DataFrame(merge_rows)
-    else:
+        df_final = pd.DataFrame(data_rows)
+        
+        # Generar ID numérico secuencial como espera la DB
+        if not df_final.empty:
+            df_final.insert(0, 'ID', range(1, len(df_final) + 1))
+
+        print(f"✅ Procesados {len(df_final)} registros de {', '.join(target_sources)}.")
+        
+        if df_final.empty:
+            return pd.DataFrame()
+
+        # Rellenar vacíos
+        df_final.fillna("", inplace=True)
+        
+        return df_final
+
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error de conexión descargando Guidelines ZIP: {e}")
+        return pd.DataFrame()
+    except Exception as e:
+        print(f"❌ Error procesando Guidelines: {e}")
+        return pd.DataFrame()
+
+def regenerar_guidelinerules(df_new_guidelines):
+    """
+    Genera GuidelineRule_Review.csv usando las reglas existentes en la DB
+    pero actualizando los GuidelineID para que coincidan con los nuevos generados.
+    """
+    db_path = "./assets/pgx_kb.sqlite3"
+    if not os.path.exists(db_path):
+        print(f"⚠️ No se encontró la base de datos en {db_path}, no se puede regenerar GuidelineRule.")
+        return pd.DataFrame()
+
+    print(f"🔄 Migrando reglas de GuidelineRule desde {db_path}...")
+    
+    try:
+        conn = sqlite3.connect(db_path)
+        
+        # Leemos las reglas antiguas junto con el PAID de su guía original
+        query = """
+        SELECT GR.ID, GR.Gene, GR.Variant, GR.Allele1, GR.Allele2, GR.Phenotype, GR.ClinAnnID, GM.PAID
+        FROM GuidelineRule GR
+        JOIN GuidelineMerge GM ON GR.GuidelineID = GM.ID
+        """
+        df_rules_old = pd.read_sql_query(query, conn)
+        conn.close()
+        
+        if df_rules_old.empty:
+            print("⚠️ La tabla GuidelineRule antigua está vacía.")
+            return pd.DataFrame()
+
+        print(f"   Leídas {len(df_rules_old)} reglas antiguas.")
+        
+        # Hacemos merge con las NUEVAS guidelines usando 'PAID' como clave
+        # df_new_guidelines tiene columnas: ID, Source, PAID, ...
+        # Queremos pegar el nuevo 'ID' donde coincida el 'PAID'
+        
+        # Renombramos para claridad
+        df_new_map = df_new_guidelines[['ID', 'PAID']].rename(columns={'ID': 'NewGuidelineID'})
+        
+        # Merge
+        df_merged = pd.merge(df_rules_old, df_new_map, on='PAID', how='inner')
+        
+        print(f"   {len(df_merged)} reglas coincidieron con las nuevas Guidelines.")
+        
+        if df_merged.empty:
+            print("⚠️ Ninguna regla coincidió (¿Cambiaron todos los IDs de PharmGKB?).")
+            return pd.DataFrame()
+
+        # Construimos el DF final
+        df_rules_final = pd.DataFrame()
+        df_rules_final['ID'] = range(1, len(df_merged) + 1) # Regeneramos ID secuencial
+        df_rules_final['Gene'] = df_merged['Gene']
+        df_rules_final['Variant'] = df_merged['Variant']
+        df_rules_final['Allele1'] = df_merged['Allele1']
+        df_rules_final['Allele2'] = df_merged['Allele2']
+        df_rules_final['Phenotype'] = df_merged['Phenotype']
+        df_rules_final['ClinAnnID'] = df_merged['ClinAnnID']
+        df_rules_final['GuidelineID'] = df_merged['NewGuidelineID'] # El nuevo ID entero
+        
+        return df_rules_final
+        
+    except Exception as e:
+        print(f"❌ Error migrando GuidelineRule: {e}")
         return pd.DataFrame()
 
 def main():
@@ -143,7 +257,6 @@ def main():
     # 1. Procesar ClinAnn
     df_clin = actualizar_clinaan()
     
-    # Ahora df_clin nunca será None, será un DF con datos o vacío
     if not df_clin.empty:
         archivo_clin = f"{output_dir}ClinAnn_Review.csv"
         df_clin.to_csv(archivo_clin, index=False)
@@ -160,9 +273,21 @@ def main():
         archivo_guide = f"{output_dir}GuidelineMerge_Review.csv"
         df_guide.to_csv(archivo_guide, index=False)
         print(f"✅ GuidelineMerge generado exitosamente: {archivo_guide} ({len(df_guide)} registros)")
-        # print(df_guide[['Source', 'Gene', 'Recommendation']].head())
+
+        # 3. Regenerar GuidelineRule (Solo si tenemos Guidelines nuevos)
+        print("\n------------------------------------------------\n")
+        df_rules = regenerar_guidelinerules(df_guide)
+        
+        if not df_rules.empty:
+            archivo_rules = f"{output_dir}GuidelineRule_Review.csv"
+            df_rules.to_csv(archivo_rules, index=False)
+            print(f"✅ GuidelineRule generado exitosamente: {archivo_rules} ({len(df_rules)} registros)")
+        else:
+             print("⚠️ No se generaron datos para GuidelineRule.")
+
     else:
         print("⚠️ No se generaron datos para Guidelines.")
+
 
 if __name__ == "__main__":
     main()
